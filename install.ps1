@@ -10,14 +10,17 @@ Write-Host "========================================" -ForegroundColor Cyan
 Write-Host ""
 
 function Resolve-Python {
-    $pythonCmd = Get-Command -Name python -ErrorAction SilentlyContinue
-    if ($null -ne $pythonCmd) {
-        return @{ Exe = 'python'; Args = @() }
-    }
+    $candidates = @(
+        @{ Exe = 'py'; Args = @('-3') },
+        @{ Exe = 'python3'; Args = @() },
+        @{ Exe = 'python'; Args = @() }
+    )
 
-    $pyCmd = Get-Command -Name py -ErrorAction SilentlyContinue
-    if ($null -ne $pyCmd) {
-        return @{ Exe = 'py'; Args = @('-3') }
+    foreach ($candidate in $candidates) {
+        $resolved = Test-PythonCandidate -Exe $candidate.Exe -Args $candidate.Args
+        if ($null -ne $resolved) {
+            return $resolved
+        }
     }
 
     return $null
@@ -58,10 +61,36 @@ function Invoke-External {
     return @{ ExitCode = $exitCode; Output = $output }
 }
 
+function Test-PythonCandidate {
+    param(
+        [Parameter(Mandatory = $true)][string]$Exe,
+        [string[]]$Args = @()
+    )
+
+    $pythonCmd = Get-Command -Name $Exe -ErrorAction SilentlyContinue
+    if ($null -eq $pythonCmd) {
+        return $null
+    }
+
+    $probeCode = 'import sys; print(sys.executable); print(sys.version.split()[0]); raise SystemExit(0 if sys.version_info >= (3, 10) else 1)'
+    $probe = Invoke-External -Exe $Exe -Args @($Args + @('-c', $probeCode)) -Quiet
+    $probeText = ($probe.Output -join "`n")
+
+    if ($probe.ExitCode -ne 0) {
+        return $null
+    }
+
+    if ($probeText -match 'Microsoft Store|WindowsApps|App execution alias|was not found') {
+        return $null
+    }
+
+    return @{ Exe = $Exe; Args = $Args }
+}
+
 # Check prerequisites
 $python = Resolve-Python
 if ($null -eq $python) {
-    Write-Host "[x] Python is required but was not found (tried 'python' and 'py')." -ForegroundColor Red
+    Write-Host "[x] Python is required but was not found (tried 'py -3', 'python3', and 'python')." -ForegroundColor Red
     exit 1
 }
 
@@ -89,7 +118,7 @@ $RepoUrl = "https://github.com/AgriciDaniel/claude-seo"
 # This default MUST be bumped on every release. CI guard
 # (tests/test_manifest_consistency.py) enforces this matches plugin.json.
 # Override: $env:CLAUDE_SEO_TAG = 'main'; .\install.ps1
-$RepoTag = if ($env:CLAUDE_SEO_TAG) { $env:CLAUDE_SEO_TAG } else { 'v2.0.0' }
+$RepoTag = if ($env:CLAUDE_SEO_TAG) { $env:CLAUDE_SEO_TAG } else { 'v2.3.1' }
 
 # Create directories
 New-Item -ItemType Directory -Force -Path $SkillDir | Out-Null
@@ -136,6 +165,15 @@ try {
         Copy-Item -Recurse -Force "$SchemaPath\*" $SkillSchema
     }
 
+    # Copy deterministic data files consumed by bundled scripts such as
+    # seo_updates.py. Keep the repository-relative data\ layout intact.
+    $DataPath = "$TempDir\data"
+    if (Test-Path $DataPath) {
+        $SkillData = "$SkillDir\data"
+        New-Item -ItemType Directory -Force -Path $SkillData | Out-Null
+        Copy-Item -Recurse -Force "$DataPath\*" $SkillData
+    }
+
     # Copy reference docs
     $PdfPath = "$TempDir\pdf"
     if (Test-Path $PdfPath) {
@@ -159,7 +197,18 @@ try {
         Copy-Item -Recurse -Force "$ScriptsPath\*" $SkillScripts
     }
 
+    # Copy the stable launcher used by skill and agent instructions. It ships in
+    # scripts/ (never a top-level bin/, which hosted marketplaces reject) and
+    # resolves runtime.py as a sibling, so it lands beside the copied scripts.
+    $LauncherSource = Join-Path $ScriptsPath 'claude-seo'
+    $SkillLauncherDir = Join-Path $SkillDir 'scripts'
+    if (Test-Path $LauncherSource) {
+        New-Item -ItemType Directory -Force -Path $SkillLauncherDir | Out-Null
+        Copy-Item -Force $LauncherSource (Join-Path $SkillLauncherDir 'claude-seo')
+    }
+
     # Copy hooks
+    Write-Host "  Note: hook enforcement requires plugin install; manual hook copy is best-effort." -ForegroundColor Yellow
     $HooksPath = "$TempDir\hooks"
     if (Test-Path $HooksPath) {
         $SkillHooks = "$SkillDir\hooks"
@@ -211,32 +260,78 @@ try {
     if (Test-Path $reqFile) {
         Copy-Item -Force $reqFile $installedReqFile
     }
-
-    # Install Python dependencies
-    Write-Host "=> Installing Python dependencies..." -ForegroundColor Yellow
-    if (Test-Path $reqFile) {
-        try {
-            $pip = Invoke-External -Exe $python.Exe -Args @($python.Args + @('-m','pip','install','-q','-r',$reqFile)) -Quiet
-            if ($pip.ExitCode -ne 0) {
-                throw ($pip.Output -join "`n")
-            }
-        } catch {
-            Write-Host "  [!]  Could not auto-install Python packages." -ForegroundColor Yellow
-            Write-Host "  Try: $($python.Exe) $($python.Args -join ' ') -m pip install -r `"$installedReqFile`"" -ForegroundColor Yellow
-        }
-    } else {
-        Write-Host "  [!]  No requirements.txt found; skipping Python dependency install." -ForegroundColor Yellow
+    $pluginManifest = Join-Path $TempDir '.claude-plugin\plugin.json'
+    if (Test-Path $pluginManifest) {
+        Copy-Item -Force $pluginManifest (Join-Path $SkillDir 'runtime-plugin.json')
     }
 
-    # Optional: Install Playwright browsers
-    Write-Host "=> Installing Playwright browsers (optional, for visual analysis)..." -ForegroundColor Yellow
-    try {
-        $pw = Invoke-External -Exe $python.Exe -Args @($python.Args + @('-m','playwright','install','chromium')) -Quiet
-        if ($pw.ExitCode -ne 0) {
-            throw ($pw.Output -join "`n")
+    # Manual installs have no ${CLAUDE_PLUGIN_ROOT}. Rewrite the canonical
+    # launcher token in installed Markdown to the absolute installed path.
+    # Claude Code's Bash tool expands $HOME on Windows as well as Unix. The
+    # replacement consumes the plugin-root token, so a second pass is a no-op.
+    $pluginRunner = '"${CLAUDE_PLUGIN_ROOT}/scripts/claude-seo" run'
+    $manualRunner = '"$HOME/.claude/skills/seo/scripts/claude-seo" run'
+    $installedDocs = @()
+    Get-ChildItem -Path $SkillsPath -Directory | ForEach-Object {
+        $sourceRoot = $_.FullName
+        $targetRoot = "$env:USERPROFILE\.claude\skills\$($_.Name)"
+        $installedDocs += Get-ChildItem -Path $sourceRoot -Recurse -File -Filter '*.md' | ForEach-Object {
+            $relative = $_.FullName.Substring($sourceRoot.Length).TrimStart('\','/')
+            Get-Item (Join-Path $targetRoot $relative) -ErrorAction SilentlyContinue
         }
-    } catch {
-        Write-Host "  [!]  Playwright install failed. Visual analysis will use WebFetch fallback." -ForegroundColor Yellow
+    }
+    Get-ChildItem -Path $ExtensionsPath -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+        $extName = $_.Name
+        $extSkills = Join-Path $_.FullName 'skills'
+        Get-ChildItem -Path $extSkills -Directory -ErrorAction SilentlyContinue | ForEach-Object {
+            $sourceRoot = $_.FullName
+            $targetRoot = "$env:USERPROFILE\.claude\skills\$($_.Name)"
+            $installedDocs += Get-ChildItem -Path $sourceRoot -Recurse -File -Filter '*.md' | ForEach-Object {
+                $relative = $_.FullName.Substring($sourceRoot.Length).TrimStart('\','/')
+                Get-Item (Join-Path $targetRoot $relative) -ErrorAction SilentlyContinue
+            }
+        }
+        $extRefs = Join-Path $_.FullName 'references'
+        if (Test-Path $extRefs) {
+            $targetRefs = Join-Path $SkillDir "extensions\$extName\references"
+            $installedDocs += Get-ChildItem -Path $extRefs -Recurse -File -Filter '*.md' | ForEach-Object {
+                $relative = $_.FullName.Substring($extRefs.Length).TrimStart('\','/')
+                Get-Item (Join-Path $targetRefs $relative) -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    $agentSources = @()
+    $agentSources += Get-ChildItem -Path $AgentsPath -File -Filter '*.md' -ErrorAction SilentlyContinue
+    $agentSources += Get-ChildItem -Path $ExtensionsPath -Recurse -File -Filter '*.md' -ErrorAction SilentlyContinue |
+        Where-Object { $_.Directory.Name -eq 'agents' }
+    $installedDocs += $agentSources | ForEach-Object {
+        Get-Item (Join-Path $AgentDir $_.Name) -ErrorAction SilentlyContinue
+    }
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    $installedDocs | ForEach-Object {
+        $text = [System.IO.File]::ReadAllText($_.FullName)
+        $pluginSetup = '"${CLAUDE_PLUGIN_ROOT}/scripts/claude-seo" setup'
+        $pluginDoctor = '"${CLAUDE_PLUGIN_ROOT}/scripts/claude-seo" doctor'
+        $manualSetup = '"$HOME/.claude/skills/seo/scripts/claude-seo" setup'
+        $manualDoctor = '"$HOME/.claude/skills/seo/scripts/claude-seo" doctor'
+        $updated = $text.Replace($pluginRunner, $manualRunner)
+        $updated = $updated.Replace($pluginSetup, $manualSetup)
+        $updated = $updated.Replace($pluginDoctor, $manualDoctor)
+        if ($updated -ne $text) {
+            [System.IO.File]::WriteAllText($_.FullName, $updated, $utf8NoBom)
+        }
+    }
+
+    # Use the same standard-library runtime on Windows. It creates an isolated
+    # .venv with Scripts\python.exe and installs Chromium through that interpreter.
+    Write-Host "=> Creating isolated Python runtime..." -ForegroundColor Yellow
+    $runtimeScript = Join-Path $SkillDir 'scripts\runtime.py'
+    $runtime = Invoke-External -Exe $python.Exe -Args @($python.Args + @($runtimeScript,'setup'))
+    if ($runtime.ExitCode -ne 0 -and $runtime.ExitCode -ne 10) {
+        throw "Core Python runtime setup failed. Installation is incomplete."
+    }
+    if ($runtime.ExitCode -eq 10) {
+        Write-Host "  [!] Core runtime installed, but Chromium setup is incomplete." -ForegroundColor Yellow
     }
 } catch {
     Write-Host ""

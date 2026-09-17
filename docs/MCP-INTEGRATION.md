@@ -17,7 +17,8 @@ Use Google's PageSpeed Insights API directly for real Core Web Vitals data.
 3. Use in your analysis:
 
 ```bash
-curl "https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=URL&key=YOUR_API_KEY"
+curl -H "X-Goog-Api-Key: $GOOGLE_API_KEY" \
+  "https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=URL"
 ```
 
 ### Google Search Console
@@ -70,7 +71,7 @@ The MCP ecosystem for SEO has matured significantly. These are production-ready 
 | **Semrush** | `https://mcp.semrush.com/v1/mcp` | Official (remote) | Full API access via remote MCP endpoint. Domain analytics, keyword research, backlink data. |
 | **Google Search Console** | `mcp-server-gsc` | Community | By ahonn. Search performance, URL inspection, sitemaps. |
 | **PageSpeed Insights** | `mcp-server-pagespeed` | Community | By enemyrr. Lighthouse audits, CWV metrics, performance scoring. |
-| **DataForSEO** | `dataforseo-mcp-server` | Official extension | 9 modules, 79 tools, 22 commands. Install: `./extensions/dataforseo/install.sh`. See [extension docs](../extensions/dataforseo/README.md). |
+| **DataForSEO** | `dataforseo-mcp-server` | Official extension | 9 modules, 79 tools, 23 commands. Install: `./extensions/dataforseo/install.sh`. See [extension docs](../extensions/dataforseo/README.md). |
 | **kwrds.ai** | kwrds MCP server | Community | Keyword research, search volume, difficulty scoring. |
 | **SEO Review Tools** | SEO Review Tools MCP | Community | Site auditing and on-page analysis API. |
 
@@ -86,11 +87,11 @@ def get_pagespeed_data(url: str, api_key: str) -> dict:
     endpoint = "https://www.googleapis.com/pagespeedonline/v5/runPagespeed"
     params = {
         "url": url,
-        "key": api_key,
         "strategy": "mobile",  # or "desktop"
         "category": ["performance", "accessibility", "best-practices", "seo"]
     }
-    response = requests.get(endpoint, params=params)
+    headers = {"X-Goog-Api-Key": api_key}
+    response = requests.get(endpoint, params=params, headers=headers)
     return response.json()
 ```
 
@@ -104,9 +105,8 @@ def get_crux_data(url: str, api_key: str) -> dict:
         "url": url,
         "formFactor": "PHONE"  # or "DESKTOP"
     }
-    headers = {"Content-Type": "application/json"}
-    params = {"key": api_key}
-    response = requests.post(endpoint, json=payload, headers=headers, params=params)
+    headers = {"Content-Type": "application/json", "X-Goog-Api-Key": api_key}
+    response = requests.post(endpoint, json=payload, headers=headers)
     return response.json()
 ```
 

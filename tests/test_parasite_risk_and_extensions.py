@@ -19,8 +19,8 @@ _SCRIPTS = _REPO_ROOT / "scripts"
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
+pytest.importorskip("requests")
 import parasite_risk  # noqa: E402
-
 
 # ---------------------------------------------------------------------------
 # parasite_risk
@@ -124,6 +124,12 @@ def test_extension_has_install_skill_and_docs(name: str, skill_dir: str) -> None
     )
 
 
+_POSIX_ONLY = pytest.mark.skipif(
+    os.name != "posix", reason="the executable bit is a POSIX mode bit; Windows has none"
+)
+
+
+@_POSIX_ONLY
 @pytest.mark.parametrize(
     "name", ["ahrefs", "seranking", "profound", "bing-webmaster", "unlighthouse"],
 )
@@ -133,6 +139,7 @@ def test_extension_install_script_is_executable(name: str) -> None:
     assert mode & stat.S_IXUSR, f"{name}/install.sh must be executable for chmod"
 
 
+@_POSIX_ONLY
 def test_every_extension_install_and_uninstall_is_executable() -> None:
     """All extensions ship executable install.sh + uninstall.sh — including v1 ones."""
     ext_root = _REPO_ROOT / "extensions"
@@ -171,7 +178,13 @@ def test_extension_skillmd_has_required_frontmatter(
     assert f"name: {skill_dir}" in head, f"{name}: frontmatter name must be {skill_dir}"
     assert "description:" in head, f"{name}: missing description"
     assert "metadata:" in head, f"{name}: missing metadata block"
-    assert 'version: "2.0.0"' in head, f"{name}: SKILL.md must declare version 2.0.0"
+    import json as _json
+    _expected = _json.loads(
+        (_REPO_ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
+    )["version"]
+    assert f'version: "{_expected}"' in head, (
+        f"{name}: SKILL.md must declare version {_expected} (from plugin.json)"
+    )
 
 
 # ---------------------------------------------------------------------------
